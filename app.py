@@ -24,20 +24,6 @@ from langchain.chains.combine_documents.map_reduce import MapReduceDocumentsChai
 from langchain_core.runnables import RunnablePassthrough
 from pathlib import Path
 
-# Configure Streamlit for Render deployment
-st.set_page_config(
-    page_title="Noww Club AI",
-    layout="wide",
-    page_icon="🤝",
-    initial_sidebar_state="expanded"
-)
-
-# Set environment variables for Render
-os.environ['STREAMLIT_SERVER_PORT'] = '10000'
-os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
-os.environ['STREAMLIT_SERVER_ENABLE_CORS'] = 'false'
-os.environ['STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION'] = 'false'
-
 # Loading environment variables
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
