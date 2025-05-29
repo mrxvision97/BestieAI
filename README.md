@@ -63,13 +63,7 @@
 
 ---
 
-## 📸 UI Preview
 
-> Screenshot examples (optional)
-- Chat interface with memory bubbles
-- Habit tracking and progress UI
-- Goal breakdown with visual steps
-- Sidebar showing mood journal entries
 
 ---
 
