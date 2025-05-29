@@ -15,7 +15,7 @@ import uuid
 import json
 import time
 import asyncio
-from typing import TypedDict, Annotated, Dict, List, Optional
+from typing import TypedDict, Annotated, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from langchain.chains import LLMChain
@@ -23,6 +23,174 @@ from langchain.chains.combine_documents.map_reduce import MapReduceDocumentsChai
 from langchain_core.runnables import RunnablePassthrough
 from pathlib import Path
 import re
+import spacy
+from dateutil import parser
+import pytz
+
+# Load spaCy model
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    # If model not found, download it
+    import subprocess
+    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+    nlp = spacy.load("en_core_web_sm")
+
+class TimeExtractor:
+    def __init__(self):
+        self.time_patterns = [
+            # Direct time patterns
+            r'(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)',
+            r'(\d{1,2}\s*(?:AM|PM|am|pm))',
+            # Relative time patterns
+            r'(?:in|after)\s+(\d+)\s*(?:hours?|hrs?)',
+            r'(?:in|after)\s+(\d+)\s*(?:minutes?|mins?)',
+            # Time-related phrases
+            r'(?:at|by|around|about|approximately)\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)',
+            r'(?:remind|reminder|set|scheduled|alarm)\s+(?:me|for|at)?\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)',
+        ]
+        self.time_indicators = {
+            'morning': 'AM',
+            'afternoon': 'PM',
+            'evening': 'PM',
+            'night': 'PM',
+            'noon': 'PM',
+            'midnight': 'AM'
+        }
+
+    def extract_time(self, text: str) -> Optional[str]:
+        """Extract time from text using NLP and pattern matching"""
+        doc = nlp(text.lower())
+        
+        # Try direct time parsing first
+        try:
+            parsed_time = parser.parse(text, fuzzy=True)
+            if parsed_time:
+                return parsed_time.strftime("%I:%M %p")
+        except:
+            pass
+
+        # Check for time-related entities
+        for ent in doc.ents:
+            if ent.label_ == "TIME":
+                try:
+                    parsed_time = parser.parse(ent.text, fuzzy=True)
+                    if parsed_time:
+                        return parsed_time.strftime("%I:%M %p")
+                except:
+                    pass
+
+        # Check for time indicators
+        for word in doc:
+            if word.text in self.time_indicators:
+                # Look for numbers near the time indicator
+                for token in doc:
+                    if token.like_num:
+                        try:
+                            hour = int(token.text)
+                            if 0 <= hour <= 23:
+                                return f"{hour:02d}:00 {self.time_indicators[word.text]}"
+                        except:
+                            pass
+
+        # Use regex patterns as fallback
+        for pattern in self.time_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                time_str = match.group(1).strip()
+                try:
+                    # Try various time formats
+                    for fmt in ["%I:%M %p", "%I:%M%p", "%H:%M", "%I:%M", "%I %p", "%I%p"]:
+                        try:
+                            parsed_time = datetime.strptime(time_str.upper(), fmt)
+                            return parsed_time.strftime("%I:%M %p")
+                        except ValueError:
+                            continue
+                    # Try parsing just the hour
+                    if re.match(r'^\d{1,2}$', time_str):
+                        hour = int(time_str)
+                        if 0 <= hour <= 23:
+                            return datetime.strptime(f"{hour}:00", "%H:%M").strftime("%I:%M %p")
+                except:
+                    continue
+
+        return None
+
+class IntentDetector:
+    def __init__(self):
+        self.intent_patterns = {
+            'habit': [
+                r'create\s+(?:a|an)?\s*habit',
+                r'start\s+(?:a|an)?\s*habit',
+                r'build\s+(?:a|an)?\s*habit',
+                r'new\s+habit',
+                r'want\s+to\s+(?:start|create|build)\s+(?:a|an)?\s*habit',
+                r'daily\s+habit',
+                r'weekly\s+habit',
+                r'regular\s+habit'
+            ],
+            'goal': [
+                r'set\s+(?:a|an)?\s*goal',
+                r'create\s+(?:a|an)?\s*goal',
+                r'new\s+goal',
+                r'want\s+to\s+(?:set|create)\s+(?:a|an)?\s*goal',
+                r'target',
+                r'objective'
+            ],
+            'reminder': [
+                r'set\s+(?:a|an)?\s*reminder',
+                r'create\s+(?:a|an)?\s*reminder',
+                r'new\s+reminder',
+                r'remind\s+me',
+                r'set\s+reminder',
+                r'create\s+reminder'
+            ]
+        }
+
+    def detect_intent(self, text: str) -> Tuple[Optional[str], float]:
+        """Detect intent using NLP and pattern matching"""
+        doc = nlp(text.lower())
+        
+        # Check for intent-related entities
+        for ent in doc.ents:
+            if ent.label_ in ["EVENT", "ACTIVITY"]:
+                if "habit" in ent.text:
+                    return "habit", 0.9
+                elif "goal" in ent.text:
+                    return "goal", 0.9
+                elif "reminder" in ent.text:
+                    return "reminder", 0.9
+
+        # Use pattern matching
+        best_intent = None
+        best_score = 0.0
+
+        for intent, patterns in self.intent_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    # Calculate confidence score based on pattern match
+                    score = 0.7  # Base score for pattern match
+                    
+                    # Boost score if intent-related words are present
+                    intent_words = {
+                        'habit': ['habit', 'routine', 'practice', 'daily', 'regular'],
+                        'goal': ['goal', 'target', 'objective', 'achieve', 'accomplish'],
+                        'reminder': ['reminder', 'remind', 'alert', 'notify', 'schedule']
+                    }
+                    
+                    for word in intent_words.get(intent, []):
+                        if word in text.lower():
+                            score += 0.1
+                    
+                    if score > best_score:
+                        best_intent = intent
+                        best_score = score
+
+        return best_intent, best_score
+
+# Initialize extractors
+time_extractor = TimeExtractor()
+intent_detector = IntentDetector()
 
 # Configure Streamlit for Render deployment - MUST BE FIRST STREAMLIT COMMAND
 st.set_page_config(
@@ -55,16 +223,34 @@ class State(TypedDict):
 
 def extract_time(input_text):
     time_patterns = [
-    r'(\d{1,2}:\d{2}\s+(?:AM|PM|am|pm))',  # 9:00 AM or 9:00 am
-    r'(\d{1,2}:\d{2}(?:AM|PM|am|pm))',     # 9:00AM or 9:00am
-    r'(\d{1,2}:\d{2})',                    # 09:00 or 9:00
-    r'(\d{1,2}\s+(?:AM|PM|am|pm))',        # 9 AM or 9 am
-    r'(\d{1,2}(?:AM|PM|am|pm))'           # "7" followed by AM/PM
+        r'(\d{1,2}:\d{2}\s+(?:AM|PM|am|pm))',  # 9:00 AM or 9:00 am
+        r'(\d{1,2}:\d{2}(?:AM|PM|am|pm))',     # 9:00AM or 9:00am
+        r'(\d{1,2}:\d{2})',                    # 09:00 or 9:00
+        r'(\d{1,2}\s+(?:AM|PM|am|pm))',        # 9 AM or 9 am
+        r'(\d{1,2}(?:AM|PM|am|pm))',           # 9AM or 9am
+        r'(?:at|remind me at|set for|scheduled for|reminder at)\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)',  # at 6 AM, remind me at 6 AM, etc.
+        r'(?:at|remind me at|set for|scheduled for|reminder at)\s+(\d{1,2}(?::\d{2})?)'  # at 6, remind me at 6, etc.
     ]
     for pattern in time_patterns:
         match = re.search(pattern, input_text.upper())
         if match:
-            return match.group(1)
+            time_str = match.group(1).strip()
+            # Convert to standard format
+            try:
+                # Try parsing with various formats
+                for fmt in ["%I:%M %p", "%I:%M%p", "%H:%M", "%I:%M", "%I %p", "%I%p"]:
+                    try:
+                        parsed_time = datetime.strptime(time_str.upper(), fmt)
+                        return parsed_time.strftime("%I:%M %p")
+                    except ValueError:
+                        continue
+                # If no format matches, try to parse just the hour
+                if re.match(r'^\d{1,2}$', time_str):
+                    hour = int(time_str)
+                    if 0 <= hour <= 23:
+                        return datetime.strptime(f"{hour}:00", "%H:%M").strftime("%I:%M %p")
+            except Exception:
+                continue
     return None
 
 def extract_days(input_text):
@@ -312,13 +498,25 @@ class EnhancedMemoryManager:
             temperature=0.7,
             model_name="gpt-4.1-nano-2025-04-14",
             api_key=openai_api_key)
-        # Initialize short-term memory with window of 10
-        self.short_term_memory = ConversationBufferWindowMemory(k=10, return_messages=True)
-        # Initialize long-term memory using summary
+        
+        # Initialize memories using the new format
+        self.short_term_memory = ConversationBufferWindowMemory(
+            k=10,
+            return_messages=True,
+            memory_key="chat_history",
+            input_key="input",
+            output_key="output"
+        )
+        
         self.long_term_memory = ConversationSummaryMemory(
             llm=self.llm,
             max_token_limit=1000,
-            return_messages=True)
+            return_messages=True,
+            memory_key="summary",
+            input_key="input",
+            output_key="output"
+        )
+        
         # User profile and preferences
         self.user_id = user_id or str(datetime.now().timestamp())
         self.user_profile = self._load_user_profile()
@@ -445,120 +643,27 @@ AI:"""
         # Saveing updated profile
         self._save_user_profile()
 
-    def get_response(self, user_input: str) -> str:
-        """
-        Get response from the conversation chain with enhanced memory handling
-        """
+    def get_response(self, user_input: str) -> Tuple[str, bool]:
+        """Get response from the conversation chain with enhanced memory handling"""
         try:
             # Get long-term context
-            long_term_context = self.long_term_memory.load_memory_variables({}).get("history", "")
+            long_term_context = self.long_term_memory.load_memory_variables({}).get("summary", "")
+            
             # Get short-term context
-            short_term_context = self.short_term_memory.load_memory_variables({}).get("history", "")
-            # Check if search is needed with context awareness
-            search_triggers = [
-                # Direct search requests
-                "show me", "find", "search for", "look up", "get information about",
-                "check", "verify", "confirm", 
-                # Time-based queries
-                "today news", "latest", "current", "recent", " current news", "new", "update", "breaking",
-                "yesterday", "tomorrow", "this week", "this month", "this year",
-                "2025", "2024", "next year", "last year", "previous year",
-                # News and information
-                "news", "headlines", "report", "coverage", "story", "article", "press", "media",
-                "announcement", "release", "statement", "update", 
-                # Financial and market
-                "stock", "market", "price", "trading", "shares", "invest", "finance", "economic",
-                "currency", "forex", "crypto", "bitcoin", "ethereum", "nft", "ipo", "dividend",
-                # Sports and entertainment
-                "score", "match", "game", "tournament", "league", "championship", "player", "team",
-                "movie", "film", "show", "series", "episode", "release", "premiere", "concert",
-                # Technology
-                "tech", "technology", "software", "hardware", "app", "application", "update", "release",
-                "launch", "announcement", "feature", "innovation", "gadget", "device",
-                # Weather and environment
-                "weather", "forecast", "temperature", "climate", "environment", "pollution",
-                "air quality", "natural disaster", "storm", "hurricane", "earthquake",
-                # Politics and world events
-                "election", "vote", "campaign", "policy", "government", "minister", "president",
-                "summit", "meeting", "conference", "treaty", "agreement", "conflict",
-                # Business and economy
-                "business", "company", "corporation", "startup", "entrepreneur", "industry",
-                "sector", "market", "trade", "commerce", "retail", "consumer",
-                # Science and research
-                "research", "study", "discovery", "scientific", "experiment", "finding",
-                "publication", "journal", "paper", "thesis", "analysis",
-                # Education
-                "education", "school", "university", "college", "course", "program",
-                "degree", "student", "teacher", "exam", "result",
-                # Social and cultural
-                "trend", "viral", "famous", "celebrity", "influencer",
-                "social media", "post", "tweet", "instagram", "facebook",
-                # Travel and tourism
-                "travel", "tourism", "vacation", "holiday", "destination", "hotel",
-                "flight", "booking", "reservation", "tour", "guide",
-                # Food and dining
-                "restaurant", "food", "cuisine", "cooking", "chef",
-                "menu", "dining", "cafe", "bistro", "bar",
-                # Real estate
-                "property", "real estate", "house", "apartment", "rent", "sale",
-                "mortgage", "loan", "interest rate", "market value",
-                # Automotive
-                "car", "vehicle", "automotive", "auto", "motor", "engine",
-                "model", "brand", "dealer", "showroom", "test drive",
-                # Fashion and lifestyle
-                "fashion", "style", "trend", "design", "collection", "brand",
-                "clothing", "accessories", "beauty", "cosmetics", "makeup",
-                # Gaming and entertainment
-                "game", "gaming", "console", "playstation", "xbox", "nintendo",
-                "esports", "tournament", "stream", "twitch", "youtube",
-                # Music and arts
-                "music", "song", "album", "artist", "concert", "performance",
-                "art", "exhibition", "gallery", "museum", "theater",
-                # Books and literature
-                "book", "author", "publisher", "release", "bestseller", "review",
-                "literature", "novel", "poetry", "magazine", "journal"
-            ]
-            # Check for general chat to prevent unnecessary searches
-            is_general_chat = any(phrase in user_input.lower() for phrase in [
-                "how are you", "hello", "hi", "hey", "greetings", "good morning",
-                "good afternoon", "good evening", "how's it going", "what's up",
-                "nice to meet you", "pleasure to meet you", "how do you do",
-                "tell me about yourself", "who are you", "what can you do",
-                "help me", "i need help", "can you help", "what's your name",
-                "what should i do", "what do you think", "do you know",
-                "can you tell me", "i want to know", "i'm curious about",
-                "explain to me", "teach me", "show me how", "guide me"
-            ])
-            # Check for follow-up questions
-            is_follow_up = any(phrase in user_input.lower() for phrase in [
-                "what do you mean", "can you explain", "i don't understand",
-                "could you clarify", "can you elaborate", "tell me more",
-                "why is that", "how come", "what makes you say that",
-                "are you sure", "is that right", "really", "interesting",
-                "that's cool", "awesome", "great", "thanks", "thank you",
-                "appreciate it", "got it", "i see", "makes sense"
-            ])
-            # Only trigger search if it's not general chat and contains search triggers
-            needs_search = any(trigger in user_input.lower() for trigger in search_triggers) and not is_general_chat and not is_follow_up
-            if needs_search:
-                try:
-                    search_results = search_tool.run(user_input)
-                    search_context = f"\nSearch Results: {search_results}"
-                except Exception as e:
-                    print(f"Search error: {str(e)}")
-                    search_context = "\nSearch failed, proceeding without search results."
-            else:
-                search_context = ""
-            # Formatting the prompt with all required variables
+            short_term_context = self.long_term_memory.load_memory_variables({}).get("chat_history", "")
+            
+            # Format the prompt with all required variables
             formatted_prompt = self.prompt.format(
-                history=str(short_term_context),  
+                history=str(short_term_context),
                 input=user_input,
                 user_profile=json.dumps(self.user_profile, indent=2),
-                long_term_context=str(long_term_context) + search_context  
+                long_term_context=str(long_term_context)
             )
-            # Get response from LLM
-            response = self.llm.predict(formatted_prompt)
-            # Updating both memories
+            
+            # Get response from LLM using invoke instead of predict
+            response = self.llm.invoke(formatted_prompt).content
+            
+            # Update both memories
             self.short_term_memory.save_context(
                 {"input": user_input},
                 {"output": response}
@@ -567,9 +672,12 @@ AI:"""
                 {"input": user_input},
                 {"output": response}
             )
-            # Updating user profile
+            
+            # Update user profile
             self._update_user_profile(user_input, response)
-            return response, needs_search
+            
+            return response, False
+            
         except Exception as e:
             print(f"Error in get_response: {str(e)}")
             return "I apologize, but I'm having trouble processing your request right now. Could you please try again?", False
@@ -579,7 +687,7 @@ AI:"""
         Get the current memory buffer including both short-term and long-term memory
         """
         short_term = self.short_term_memory.buffer
-        long_term = self.long_term_memory.load_memory_variables({}).get("history", "")
+        long_term = self.long_term_memory.load_memory_variables({}).get("summary", "")
         return f"""Short-term Memory (Last 10 interactions):
 {short_term}
 Long-term Memory Summary:
@@ -902,13 +1010,11 @@ if "thread_id" not in st.session_state:
 if "conversation_history" not in st.session_state:
     st.session_state.conversation_history = []
 if "memory_manager" not in st.session_state:
-    st.session_state.memory_manager = EnhancedMemoryManager(st.session_state.user_id)
+    st.session_state.memory_manager = None
 if "proactive_messenger" not in st.session_state:
-    st.session_state.proactive_messenger = ProactiveMessenger()
+    st.session_state.proactive_messenger = None
 if "last_interaction_time" not in st.session_state:
     st.session_state.last_interaction_time = time.time()
-
-# Add state for interactive flows
 if "current_flow" not in st.session_state:
     st.session_state.current_flow = None
 if "flow_data" not in st.session_state:
@@ -925,92 +1031,17 @@ def reset_flow():
     st.session_state.flow_data = {}
     st.session_state.button_counter = 0
 
-# Header
-st.markdown("""
-<div class="main-header">
-    <h1>🤖 Noww Club AI</h1>
-    <p>Your Digital Bestie</p>
-    <div class="capabilities">
-        <span class="capability">🧠 Memory</span>
-        <span class="capability">🔍 Search</span>
-        <span class="capability">💭 Proactive</span>
-        <span class="capability">🎯 Adaptive</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# Sidebar 
-with st.sidebar:
-    st.header("🧠 Noww Club AI")
-    st.subheader("🔮 Your Profile")
-    memory_manager = st.session_state.memory_manager
-    user_profile = memory_manager.get_user_profile()
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Conversations", user_profile.get("total_conversations", 0))
-    with col2:
-        st.metric("Relationship", "Established" if user_profile.get("total_conversations", 0) > 20 else "Developing" if user_profile.get("total_conversations", 0) > 5 else "New")
-    # Display Habits Section
-    st.subheader("🎯 Active Habits")
-    if user_profile.get("habits", {}).get("active_habits"):
-        for habit in user_profile["habits"]["active_habits"]:
-            with st.expander(f"📌 {habit['name']}"):
-                st.write(f"**Frequency:** {habit['frequency']}")
-                st.write(f"**Started:** {datetime.fromisoformat(habit['start_date']).strftime('%Y-%m-%d')}")
-                st.write(f"**Motivation:** {habit['motivation']}")
-    else:
-        st.info("No active habits yet. Start a conversation to create one!")
-    # Display Goals Section
-    st.subheader("🎯 Active Goals")
-    if user_profile.get("goals", {}).get("active_goals"):
-        for goal in user_profile["goals"]["active_goals"]:
-            with st.expander(f"🎯 {goal['name']}"):
-                st.write(f"**Target Date:** {goal['target_date']}")
-                st.write(f"**Progress:** {goal['progress']}%")
-                st.write("**Steps:**")
-                for step in goal['steps']:
-                    st.write(f"- {step}")
-    else:
-        st.info("No active goals yet. Start a conversation to set one!")
-    # Display Mood History Section
-    st.subheader("😊 Recent Moods")
-    if user_profile.get("mood_journal", {}).get("entries"):
-        recent_moods = user_profile["mood_journal"]["entries"][-3:]
-        for entry in recent_moods:
-            with st.expander(f"{datetime.fromisoformat(entry['timestamp']).strftime('%Y-%m-%d')}: {entry['mood']}"):
-                st.write(entry['notes'])
-    else:
-        st.info("No mood entries yet. Start a conversation to add one!")
-    # Display Notification Settings
-    st.subheader("🔔 Notification Settings")
-    if user_profile.get("notification_preferences", {}).get("method"):
-        prefs = user_profile["notification_preferences"]
-        st.write(f"**Method:** {prefs['method']}")
-        st.write(f"**Frequency:** {prefs['frequency']}")
-        if prefs.get("custom_schedule"):
-            st.write(f"**Schedule:** {prefs['custom_schedule']}")
-    else:
-        st.info("No notification preferences set yet.")
-    st.markdown("---")
-    if st.button("🔄 New Conversation", type="primary"):
-        st.session_state.thread_id = str(uuid.uuid4())
-        st.session_state.conversation_history = []
-        st.rerun()
-    if st.button("🗑️ Clear All Memory"):
-        st.session_state.memory_manager = EnhancedMemoryManager(st.session_state.user_id)
-        st.session_state.conversation_history = []
-        st.rerun()
-
-# Main chat interface
-st.subheader("💬 Chat")
 def handle_habit_flow(user_input: str) -> str:
     """Handle the interactive habit creation flow"""
-    print(f"Current flow step: {st.session_state.flow_step}")  # Debug print
-    print(f"User input: {user_input}")  # Debug print
-    if st.session_state.flow_step == 0:  # Initial habit name
-        st.session_state.flow_data["habit_name"] = user_input
-        st.session_state.flow_step += 1
-        return """Great! How often would you like to practice this habit?
+    print(f"Current flow step: {st.session_state.flow_step}")
+    print(f"User input: {user_input}")
+    
+    # If we're in the habit flow, stay in it regardless of input content
+    if st.session_state.current_flow == "habit":
+        if st.session_state.flow_step == 0:  # Initial habit name
+            st.session_state.flow_data["habit_name"] = user_input
+            st.session_state.flow_step += 1
+            return """Great! How often would you like to practice this habit?
 
 **Available Options:**
 1. Daily
@@ -1018,21 +1049,12 @@ def handle_habit_flow(user_input: str) -> str:
 3. Specific Days
 
 You can type either the number or the full option name!"""
-    elif st.session_state.flow_step == 1:  # Frequency
-        options = ["Daily", "Weekly", "Specific Days"]
-        selected_idx = extract_option(user_input, options)
+        elif st.session_state.flow_step == 1:  # Frequency
+            options = ["Daily", "Weekly", "Specific Days"]
+            selected_idx = extract_option(user_input, options)
 
-        if selected_idx == -1:
-            return """I noticed your message might match more than one option. Could you please clarify which one you meant?
-
-**Available Options:**
-1. Daily
-2. Weekly
-3. Specific Days
-
-You can type either the number or the full option name!"""
-        elif selected_idx is None:
-            return """Please choose from the following:
+            if selected_idx == -1:
+                return """I noticed your message might match more than one option. Could you please clarify which one you meant?
 
 **Available Options:**
 1. Daily
@@ -1040,14 +1062,23 @@ You can type either the number or the full option name!"""
 3. Specific Days
 
 You can type either the number or the full option name!"""
-        else:
-            st.session_state.flow_data["frequency"] = options[selected_idx]
-            if options[selected_idx] in ["Daily", "Weekly"]:
-                st.session_state.flow_step = 3
-                return "What's your motivation for this habit?"
+            elif selected_idx is None:
+                return """Please choose from the following:
+
+**Available Options:**
+1. Daily
+2. Weekly
+3. Specific Days
+
+You can type either the number or the full option name!"""
             else:
-                st.session_state.flow_step = 2
-                return """Which days would you like to practice? (You can select multiple)
+                st.session_state.flow_data["frequency"] = options[selected_idx]
+                if options[selected_idx] in ["Daily", "Weekly"]:
+                    st.session_state.flow_step = 3
+                    return "What's your motivation for this habit?"
+                else:
+                    st.session_state.flow_step = 2
+                    return """Which days would you like to practice? (You can select multiple)
 
 **Available Days:**
 1. Monday
@@ -1059,10 +1090,10 @@ You can type either the number or the full option name!"""
 7. Sunday
 
 Type the number or name of the day you want to add, or type 'continue' when you're done!"""
-    elif st.session_state.flow_step == 2:  # Specific days selection
-        days = extract_days(user_input)
-        if not days and user_input.lower() != "continue":
-            return """Could not find any valid days in your message. Please try again or type 'continue' to proceed.
+        elif st.session_state.flow_step == 2:  # Specific days selection
+            days = extract_days(user_input)
+            if not days and user_input.lower() != "continue":
+                return """Could not find any valid days in your message. Please try again or type 'continue' to proceed.
 
 **Available Days:**
 1. Monday
@@ -1074,20 +1105,20 @@ Type the number or name of the day you want to add, or type 'continue' when you'
 7. Sunday
 
 Type the number or name of the day you want to add, or type 'continue' when you're done!"""
-        elif days:
-            if "selected_days" not in st.session_state.flow_data:
-                st.session_state.flow_data["selected_days"] = []
-            st.session_state.flow_data["selected_days"].extend(days)
-            return f"""Days selected so far: {', '.join(set(st.session_state.flow_data['selected_days']))}
+            elif days:
+                if "selected_days" not in st.session_state.flow_data:
+                    st.session_state.flow_data["selected_days"] = []
+                st.session_state.flow_data["selected_days"].extend(days)
+                return f"""Days selected so far: {', '.join(set(st.session_state.flow_data['selected_days']))}
 
 Continue adding or type 'continue'."""
-        elif user_input.lower() == "continue":
-            if "selected_days" in st.session_state.flow_data and st.session_state.flow_data["selected_days"]:
-                st.session_state.flow_data["frequency"] = f"Every {', '.join(set(st.session_state.flow_data['selected_days']))}"
-                st.session_state.flow_step = 3
-                return "What's your motivation for this habit?"
-            else:
-                return """Please select at least one day!
+            elif user_input.lower() == "continue":
+                if "selected_days" in st.session_state.flow_data and st.session_state.flow_data["selected_days"]:
+                    st.session_state.flow_data["frequency"] = f"Every {', '.join(set(st.session_state.flow_data['selected_days']))}"
+                    st.session_state.flow_step = 3
+                    return "What's your motivation for this habit?"
+                else:
+                    return """Please select at least one day!
 
 **Available Days:**
 1. Monday
@@ -1100,10 +1131,10 @@ Continue adding or type 'continue'."""
 
 Type the number or name of the day you want to add, or type 'continue' when you're done!"""
 
-    elif st.session_state.flow_step == 3:  # Motivation
-        st.session_state.flow_data["motivation"] = user_input
-        st.session_state.flow_step = 4
-        return """How would you like to receive reminders?
+        elif st.session_state.flow_step == 3:  # Motivation
+            st.session_state.flow_data["motivation"] = user_input
+            st.session_state.flow_step = 4
+            return """How would you like to receive reminders?
 
 **Available Options:**
 1. Push Notification
@@ -1112,21 +1143,12 @@ Type the number or name of the day you want to add, or type 'continue' when you'
 
 You can type either the number or the full option name!"""
 
-    elif st.session_state.flow_step == 4:  # Notification method
-        options = ["Push Notification", "WhatsApp", "Google Calendar"]
-        selected_idx = extract_option(user_input, options)
+        elif st.session_state.flow_step == 4:  # Notification method
+            options = ["Push Notification", "WhatsApp", "Google Calendar"]
+            selected_idx = extract_option(user_input, options)
 
-        if selected_idx == -1:
-            return """I noticed your message might match more than one notification method. Could you please clarify which one you meant?
-
-**Available Options:**
-1. Push Notification
-2. WhatsApp
-3. Google Calendar
-
-You can type either the number or the full option name!"""
-        elif selected_idx is None:
-            return """Please choose from the following:
+            if selected_idx == -1:
+                return """I noticed your message might match more than one notification method. Could you clarify which one you meant?
 
 **Available Options:**
 1. Push Notification
@@ -1134,32 +1156,36 @@ You can type either the number or the full option name!"""
 3. Google Calendar
 
 You can type either the number or the full option name!"""
-        else:
-            st.session_state.flow_data["notification_method"] = options[selected_idx]
-            st.session_state.flow_step = 5
-            return """What time would you like to receive reminders?
+            elif selected_idx is None:
+                return """Please choose from the following:
+
+**Available Options:**
+1. Push Notification
+2. WhatsApp
+3. Google Calendar
+
+You can type either the number or the full option name!"""
+            else:
+                st.session_state.flow_data["notification_method"] = options[selected_idx]
+                st.session_state.flow_step = 5
+                return """What time would you like to receive reminders?
 
 **Example Formats:**
 1. 7:00 AM
 2. 9 PM
 3. 15:30
 4. 7 AM
+5. remind me at 6 AM
+6. set for 8:30 PM
+7. in the morning
+8. every evening at 8
 
 Type your preferred time in any of these formats!"""
 
-    elif st.session_state.flow_step == 5:  # Time
-        time_str = extract_time(user_input)
-        if time_str:
-            parsed_time = None
-            for fmt in ["%I:%M %p", "%I:%M%p", "%H:%M", "%I:%M", "%I %p", "%I%p"]:
-                try:
-                    parsed_time = datetime.strptime(time_str.upper(), fmt)
-                    break
-                except ValueError:
-                    continue
-            if parsed_time:
-                time = parsed_time.strftime("%I:%M %p")
-                st.session_state.flow_data["notification_time"] = time
+        elif st.session_state.flow_step == 5:  # Time
+            time_str = time_extractor.extract_time(user_input)
+            if time_str:
+                st.session_state.flow_data["notification_time"] = time_str
                 memory_manager = st.session_state.memory_manager
                 memory_manager.add_habit(
                     habit_name=st.session_state.flow_data["habit_name"],
@@ -1169,7 +1195,7 @@ Type your preferred time in any of these formats!"""
                 memory_manager.set_notification_preferences(
                     method=st.session_state.flow_data["notification_method"],
                     frequency=st.session_state.flow_data["frequency"],
-                    custom_schedule=time
+                    custom_schedule=time_str
                 )
                 habit_name = st.session_state.flow_data["habit_name"]
                 frequency = st.session_state.flow_data["frequency"]
@@ -1182,7 +1208,7 @@ Type your preferred time in any of these formats!"""
 - **Name:** {habit_name}
 - **Frequency:** {frequency}
 - **Motivation:** {motivation}
-- **Reminders:** {notification_method} at {time}
+- **Reminders:** {notification_method} at {time_str}
 
 Your habit is now active and you can track your progress in the sidebar. I'm here to support you on this journey!
 
@@ -1193,15 +1219,28 @@ Your habit is now active and you can track your progress in the sidebar. I'm her
 4. Or just chat about something else
 
 Type your choice (number or full option)!"""
-        return """Please enter a valid time format.
+            return """Please enter a valid time format.
 
 **Example Formats:**
 1. 7:00 AM
 2. 9 PM
 3. 15:30
 4. 7 AM
+5. remind me at 6 AM
+6. set for 8:30 PM
+7. in the morning
+8. every evening at 8
 
 Type your preferred time in any of these formats!"""
+    
+    # If we're not in the habit flow, check if we should start it
+    intent, confidence = intent_detector.detect_intent(user_input)
+    if intent == "habit" and confidence >= 0.7:
+        st.session_state.current_flow = "habit"
+        st.session_state.flow_step = 0
+        return "Great! What habit would you like to build?"
+    
+    return None
 
 def handle_goal_flow(user_input: str) -> str:
     """Handle the interactive goal creation flow"""
@@ -1372,11 +1411,144 @@ You can type either the number or the full option name!"""
         else:
             st.session_state.flow_data["notification_method"] = options[selected_idx]
             st.session_state.flow_step = 4
-            return """⏰ Reminder set successfully!
-**What:** {reminder_text}
-**When:** {reminder_time}
-**How:** {notification_method}
+            return f"""⏰ Reminder set successfully!
+**What:** {st.session_state.flow_data['reminder_text']}
+**When:** {st.session_state.flow_data['reminder_time']}
+**How:** {st.session_state.flow_data['notification_method']}
 I'll make sure to remind you at the specified time. Is there anything else you'd like to set up?"""
+
+def process_user_input(user_input: str):
+    """Process user input and handle different flows"""
+    try:
+        # Add user message to history
+        st.session_state.conversation_history.append({"role": "user", "content": user_input})
+        st.session_state.last_interaction_time = time.time()
+        
+        # Detect intent
+        intent, confidence = intent_detector.detect_intent(user_input)
+        
+        # Handle ongoing flows
+        if st.session_state.current_flow == "habit":
+            response = handle_habit_flow(user_input)
+        elif st.session_state.current_flow == "goal":
+            response = handle_goal_flow(user_input)
+        elif st.session_state.current_flow == "reminder":
+            response = handle_reminder_flow(user_input)
+        # Check for new flow intents
+        elif intent == "habit" and confidence >= 0.7:
+            st.session_state.current_flow = "habit"
+            st.session_state.flow_step = 0
+            response = "Great! What habit would you like to build?"
+        elif intent == "goal" and confidence >= 0.7:
+            st.session_state.current_flow = "goal"
+            st.session_state.flow_step = 0
+            response = "Great! What goal would you like to achieve?"
+        elif intent == "reminder" and confidence >= 0.7:
+            st.session_state.current_flow = "reminder"
+            st.session_state.flow_step = 0
+            response = "What would you like to be reminded about?"
+        else:
+            # Get response from memory manager
+            response, used_search = st.session_state.memory_manager.get_response(user_input)
+        
+        # Add assistant response to history
+        st.session_state.conversation_history.append({
+            "role": "assistant",
+            "content": response,
+            "used_search": used_search if 'used_search' in locals() else False
+        })
+        
+    except Exception as e:
+        st.error(f"I encountered an error: {str(e)}")
+        st.info("Please try again - I'm still learning!")
+
+# Initialize memory manager if not already initialized
+if st.session_state.memory_manager is None:
+    st.session_state.memory_manager = EnhancedMemoryManager(st.session_state.user_id)
+
+# Header
+st.markdown("""
+<div class="main-header">
+    <h1>🤖 Noww Club AI</h1>
+    <p>Your Digital Bestie</p>
+    <div class="capabilities">
+        <span class="capability">🧠 Memory</span>
+        <span class="capability">🔍 Search</span>
+        <span class="capability">💭 Proactive</span>
+        <span class="capability">🎯 Adaptive</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Sidebar 
+with st.sidebar:
+    st.header("🧠 Noww Club AI")
+    st.subheader("🔮 Your Profile")
+    memory_manager = st.session_state.memory_manager
+    user_profile = memory_manager.get_user_profile()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Conversations", user_profile.get("total_conversations", 0))
+    with col2:
+        st.metric("Relationship", "Established" if user_profile.get("total_conversations", 0) > 20 else "Developing" if user_profile.get("total_conversations", 0) > 5 else "New")
+    
+    # Display Habits Section
+    st.subheader("🎯 Active Habits")
+    if user_profile.get("habits", {}).get("active_habits"):
+        for habit in user_profile["habits"]["active_habits"]:
+            with st.expander(f"📌 {habit['name']}"):
+                st.write(f"**Frequency:** {habit['frequency']}")
+                st.write(f"**Started:** {datetime.fromisoformat(habit['start_date']).strftime('%Y-%m-%d')}")
+                st.write(f"**Motivation:** {habit['motivation']}")
+    else:
+        st.info("No active habits yet. Start a conversation to create one!")
+    
+    # Display Goals Section
+    st.subheader("🎯 Active Goals")
+    if user_profile.get("goals", {}).get("active_goals"):
+        for goal in user_profile["goals"]["active_goals"]:
+            with st.expander(f"🎯 {goal['name']}"):
+                st.write(f"**Target Date:** {goal['target_date']}")
+                st.write(f"**Progress:** {goal['progress']}%")
+                st.write("**Steps:**")
+                for step in goal['steps']:
+                    st.write(f"- {step}")
+    else:
+        st.info("No active goals yet. Start a conversation to set one!")
+    
+    # Display Mood History Section
+    st.subheader("😊 Recent Moods")
+    if user_profile.get("mood_journal", {}).get("entries"):
+        recent_moods = user_profile["mood_journal"]["entries"][-3:]
+        for entry in recent_moods:
+            with st.expander(f"{datetime.fromisoformat(entry['timestamp']).strftime('%Y-%m-%d')}: {entry['mood']}"):
+                st.write(entry['notes'])
+    else:
+        st.info("No mood entries yet. Start a conversation to add one!")
+    
+    # Display Notification Settings
+    st.subheader("🔔 Notification Settings")
+    if user_profile.get("notification_preferences", {}).get("method"):
+        prefs = user_profile["notification_preferences"]
+        st.write(f"**Method:** {prefs['method']}")
+        st.write(f"**Frequency:** {prefs['frequency']}")
+        if prefs.get("custom_schedule"):
+            st.write(f"**Schedule:** {prefs['custom_schedule']}")
+    else:
+        st.info("No notification preferences set yet.")
+    
+    st.markdown("---")
+    if st.button("🔄 New Conversation", type="primary"):
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.conversation_history = []
+        st.rerun()
+    if st.button("🗑️ Clear All Memory"):
+        st.session_state.memory_manager = EnhancedMemoryManager(st.session_state.user_id)
+        st.session_state.conversation_history = []
+        st.rerun()
+
+# Main chat interface
+st.subheader("💬 Chat")
 
 # Chat display
 chat_container = st.container()
@@ -1446,67 +1618,9 @@ with st.form(key="message_form", clear_on_submit=True):
         send_button = st.form_submit_button("Send 💬", use_container_width=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Handling message processing
+# Handle form submission
 if send_button and user_input:
-    try:
-        # Add user message to history
-        st.session_state.conversation_history.append({"role": "user", "content": user_input})
-        st.session_state.last_interaction_time = time.time()
-        memory_manager = st.session_state.memory_manager
-
-        # Check for intent to create habit, set goal, or set reminder
-        habit_intent_phrases = [
-            "create a habit", "start a habit", "build a habit", "new habit",
-            "want to start", "want to create", "want to build",
-            "daily habit", "weekly habit", "regular habit"
-        ]
-        goal_intent_phrases = [
-            "set a goal", "create a goal", "new goal", "want to achieve",
-            "want to set", "want to create", "target", "objective"
-        ]
-        reminder_intent_phrases = [
-            "set a reminder", "create a reminder", "new reminder",
-            "remind me", "set reminder", "create reminder"
-        ]
-        user_input_lower = user_input.lower()
-
-        # Reset flow if starting a new one
-        if any(phrase in user_input_lower for phrase in habit_intent_phrases + goal_intent_phrases + reminder_intent_phrases):
-            reset_flow()
-
-        # Handle ongoing flows
-        if st.session_state.current_flow == "habit":
-            response = handle_habit_flow(user_input)
-        elif st.session_state.current_flow == "goal":
-            response = handle_goal_flow(user_input)
-        elif st.session_state.current_flow == "reminder":
-            response = handle_reminder_flow(user_input)
-        # Check for new flow intents
-        elif any(phrase in user_input_lower for phrase in habit_intent_phrases):
-            st.session_state.current_flow = "habit"
-            st.session_state.flow_step = 0
-            response = "Great! What habit would you like to build?"
-        elif any(phrase in user_input_lower for phrase in goal_intent_phrases):
-            st.session_state.current_flow = "goal"
-            st.session_state.flow_step = 0
-            response = "Great! What goal would you like to achieve?"
-        elif any(phrase in user_input_lower for phrase in reminder_intent_phrases):
-            st.session_state.current_flow = "reminder"
-            st.session_state.flow_step = 0
-            response = "What would you like to be reminded about?"
-        else:
-            with st.spinner("🤔 Thinking..."):
-                response, used_search = memory_manager.get_response(user_input)
-
-        # Add assistant response to history
-        st.session_state.conversation_history.append({
-            "role": "assistant",
-            "content": response,
-            "used_search": used_search if 'used_search' in locals() else False
-        })
-    except Exception as e:
-        st.error(f"I encountered an error: {str(e)}")
-        st.info("Please try again - I'm still learning!")
+    process_user_input(user_input)
     st.rerun()
 
 st.markdown("---")
