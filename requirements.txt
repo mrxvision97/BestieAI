@@ -14,7 +14,7 @@ langgraph
 # Type hints and utilities
 typing-extensions
 pydantic
-
+regex
 # Date and time handling
 python-dateutil
 
